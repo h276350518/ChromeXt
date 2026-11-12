@@ -192,30 +192,59 @@ object ScriptDbManager {
     dbHelper.close()
   }
 
+  // The storage column can grow very large: a script caching its data with
+  // GM_setValue (e.g. an adblock script holding ~10MB of filter rules).
+  // Loading it in the same bulk cursor used to fail the whole module at
+  // startup: a single row bigger than the CursorWindow made moveToNext()
+  // throw SQLiteBlobTooBigException, which killed ScriptDbManager's static
+  // initializer and left every UserScript hook dead (NoClassDefFoundError).
+  // So the bulk query reads only id/meta/code, and each script's storage is
+  // loaded separately, with a failure isolated to that one script.
   private fun query(
       selection: String? = null,
       selectionArgs: Array<String>? = null,
   ): MutableList<Script> {
     val dbHelper = ScriptDbHelper(Chrome.getContext())
     val db = dbHelper.readableDatabase
-    val cursor = db.query("script", null, selection, selectionArgs, null, null, null)
+    val cursor =
+        db.query("script", arrayOf("id", "meta", "code"), selection, selectionArgs, null, null, null)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      (cursor as AbstractWindowedCursor).setWindow(CursorWindow("max", 1024 * 1024 * 10.toLong()))
+      (cursor as AbstractWindowedCursor)
+          .setWindow(CursorWindow("max", 1024 * 1024 * 256.toLong()))
     }
     val quried_scripts = mutableListOf<Script>()
+    val rows = mutableListOf<Triple<String, String, String>>()
     with(cursor) {
       while (moveToNext()) {
-        val id = getString(getColumnIndexOrThrow("id"))
-        val meta = getString(getColumnIndexOrThrow("meta"))
-        val code = getString(getColumnIndexOrThrow("code"))
-        val storage = getString(getColumnIndexOrThrow("storage"))
-        val script = parseScript(meta + code, storage)
-        if (script != null && script.id == id) {
-          quried_scripts.add(script)
-        }
+        rows.add(
+            Triple(
+                getString(getColumnIndexOrThrow("id")),
+                getString(getColumnIndexOrThrow("meta")),
+                getString(getColumnIndexOrThrow("code"))))
       }
     }
     cursor.close()
+    rows.forEach { (id, meta, code) ->
+      val storage =
+          runCatching {
+                val storageCursor =
+                    db.query("script", arrayOf("storage"), "id = ?", arrayOf(id), null, null, null)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                  (storageCursor as AbstractWindowedCursor)
+                      .setWindow(CursorWindow("max", 1024 * 1024 * 256.toLong()))
+                }
+                storageCursor.use { if (it.moveToFirst()) it.getString(0) else null }
+              }
+              .onFailure {
+                Log.e("Fail to load storage for script ${id}, loading it without storage.")
+                Log.ex(it)
+              }
+              .getOrNull()
+      val script = parseScript(meta + code, storage)
+      if (script != null && script.id == id) {
+        quried_scripts.add(script)
+      }
+    }
     dbHelper.close()
     return quried_scripts
   }
